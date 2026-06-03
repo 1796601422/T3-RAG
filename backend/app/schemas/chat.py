@@ -36,6 +36,7 @@ class ChatResponse(BaseModel):
     confidence: float
     citations: list[Citation]
     retrieved_chunks: list[RetrievedChunk]
+    rejected_chunks: list[RetrievedChunk] = []
     fallback_reason: str | None = None
     retrieval_debug: dict | None = None
 

@@ -5,6 +5,7 @@ from sqlalchemy import text
 
 from app.api.chat import router as chat_router
 from app.api.documents import router as documents_router
+from app.api.prd import router as prd_router
 from app.api.runtime_config import router as config_router
 from app.core.config import get_settings
 from app.db.base import Base
@@ -56,4 +57,5 @@ def _ensure_document_columns() -> None:
 
 app.include_router(documents_router, prefix=settings.api_prefix)
 app.include_router(chat_router, prefix=settings.api_prefix)
+app.include_router(prd_router, prefix=settings.api_prefix)
 app.include_router(config_router, prefix=settings.api_prefix)

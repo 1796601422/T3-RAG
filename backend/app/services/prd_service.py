@@ -1,78 +1,93 @@
 import json
+import re
 from collections.abc import Generator
 from pathlib import Path
 
 from app.core.config import get_settings
-from app.db.session import SessionLocal
-from app.models.chat_log import ChatLog
-from app.prompts.qa import FALLBACK_ANSWER, build_messages
-from app.schemas.chat import ChatResponse, Citation, RetrievedChunk
+from app.prompts.prd import build_prd_messages
+from app.schemas.chat import Citation, RetrievedChunk
+from app.schemas.prd import PrdResponse
+from app.services.conversation_memory import ConversationMemory, get_prd_memory
 from app.services.dashscope_provider import ProviderError, get_dashscope_provider
 from app.services.retrieval import RetrievalResult, get_retrieval_service
 
 
-class ChatService:
+class PrdService:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.provider = get_dashscope_provider()
         self.retriever = get_retrieval_service()
+        self.memory: ConversationMemory = get_prd_memory()
 
-    def answer(self, question: str, *, top_k: int | None = None, similarity_threshold: float | None = None) -> ChatResponse:
-        result = self.retriever.retrieve(question, top_k=top_k, similarity_threshold=similarity_threshold)
-        if not result.contexts:
-            response = self._fallback_response(result)
-            self._log_chat(question, response)
-            return response
-
-        prompt_contexts = [self._to_prompt_context(index, item) for index, item in enumerate(result.contexts, start=1)]
-        messages = build_messages(question, prompt_contexts)
-        image_items = self._image_prompt_items(result.contexts)
-        if image_items:
-            answer = self.provider.complete_multimodal_chat(messages, image_items)
-        else:
-            answer = self.provider.complete_chat(messages)
-        response = self._build_response(answer, result)
-        self._log_chat(question, response)
-        return response
-
-    def stream_answer(
+    def generate(
         self,
-        question: str,
+        session_id: str,
+        requirement: str,
         *,
+        use_rag: bool = True,
         top_k: int | None = None,
         similarity_threshold: float | None = None,
+        source_context: str | None = None,
+    ) -> PrdResponse:
+        memory_version = self.memory.version(session_id)
+        history = self.memory.get(session_id)
+        result = self._retrieve(requirement, use_rag=use_rag, top_k=top_k, similarity_threshold=similarity_threshold)
+        messages = self._build_messages(requirement, history, result, rag_enabled=use_rag, source_context=source_context)
+        image_items = self._image_prompt_items(result.contexts)
+        if image_items:
+            answer = self.provider.complete_multimodal_chat(messages, image_items, temperature=0.35)
+        else:
+            answer = self.provider.complete_chat(messages, temperature=0.35)
+        answer = self._strip_think_blocks(answer).strip()
+        response = self._build_response(answer, result, rag_enabled=use_rag)
+        self.memory.append_turn_if_version(session_id, memory_version, requirement, response.answer)
+        return response
+
+    def stream_generate(
+        self,
+        session_id: str,
+        requirement: str,
+        *,
+        use_rag: bool = True,
+        top_k: int | None = None,
+        similarity_threshold: float | None = None,
+        source_context: str | None = None,
     ) -> Generator[str, None, None]:
         try:
-            result = self.retriever.retrieve(question, top_k=top_k, similarity_threshold=similarity_threshold)
-            if not result.contexts:
-                fallback = self._fallback_response(result)
-                self._log_chat(question, fallback)
-                yield self._sse_event("token", {"content": fallback.answer})
-                yield self._sse_event("meta", fallback.model_dump())
-                yield self._sse_event("done", {"ok": True})
-                return
-
-            prompt_contexts = [self._to_prompt_context(index, item) for index, item in enumerate(result.contexts, start=1)]
-            messages = build_messages(question, prompt_contexts)
+            memory_version = self.memory.version(session_id)
+            history = self.memory.get(session_id)
+            result = self._retrieve(
+                requirement,
+                use_rag=use_rag,
+                top_k=top_k,
+                similarity_threshold=similarity_threshold,
+            )
+            messages = self._build_messages(
+                requirement,
+                history,
+                result,
+                rag_enabled=use_rag,
+                source_context=source_context,
+            )
             image_items = self._image_prompt_items(result.contexts)
-            if image_items:
-                accumulated: list[str] = []
-                for token in self.provider.stream_multimodal_chat(messages, image_items):
-                    accumulated.append(token)
-                    yield self._sse_event("token", {"content": token})
-
-                response = self._build_response(self._strip_think_blocks("".join(accumulated)).strip(), result)
-                self._log_chat(question, response)
-                yield self._sse_event("meta", response.model_dump())
-                yield self._sse_event("done", {"ok": True})
-                return
             accumulated: list[str] = []
-            for token in self.provider.stream_chat(messages):
+            stream = (
+                self.provider.stream_multimodal_chat(
+                    messages,
+                    image_items,
+                    temperature=0.35,
+                    enable_thinking=False,
+                )
+                if image_items
+                else self.provider.stream_chat(messages, temperature=0.35, enable_thinking=False)
+            )
+            for token in stream:
                 accumulated.append(token)
                 yield self._sse_event("token", {"content": token})
 
-            response = self._build_response(self._strip_think_blocks("".join(accumulated)).strip(), result)
-            self._log_chat(question, response)
+            answer = self._strip_think_blocks("".join(accumulated)).strip()
+            response = self._build_response(answer, result, rag_enabled=use_rag)
+            self.memory.append_turn_if_version(session_id, memory_version, requirement, response.answer)
             yield self._sse_event("meta", response.model_dump())
             yield self._sse_event("done", {"ok": True})
         except ProviderError as exc:
@@ -80,7 +95,41 @@ class ChatService:
         except Exception as exc:
             yield self._sse_event("app-error", {"message": str(exc)})
 
-    def _build_response(self, answer: str, result: RetrievalResult) -> ChatResponse:
+    def _retrieve(
+        self,
+        requirement: str,
+        *,
+        use_rag: bool,
+        top_k: int | None,
+        similarity_threshold: float | None,
+    ) -> RetrievalResult:
+        if not use_rag:
+            return RetrievalResult([], 0.0, None)
+        return self.retriever.retrieve(
+            requirement,
+            top_k=top_k,
+            similarity_threshold=similarity_threshold,
+        )
+
+    def _build_messages(
+        self,
+        requirement: str,
+        history: list[dict],
+        result: RetrievalResult,
+        *,
+        rag_enabled: bool,
+        source_context: str | None = None,
+    ) -> list[dict]:
+        prompt_contexts = [self._to_prompt_context(index, item) for index, item in enumerate(result.contexts, start=1)]
+        return build_prd_messages(
+            requirement,
+            prompt_contexts,
+            history,
+            rag_enabled=rag_enabled,
+            source_context=source_context,
+        )
+
+    def _build_response(self, answer: str, result: RetrievalResult, *, rag_enabled: bool) -> PrdResponse:
         citations = [
             Citation(
                 chunk_id=item.chunk_id,
@@ -123,39 +172,17 @@ class ChatService:
             )
             for item in result.rejected_contexts
         ]
-        return ChatResponse(
-            answer=answer or FALLBACK_ANSWER,
-            confidence=result.confidence,
+        return PrdResponse(
+            answer=answer,
+            prd=answer,
+            rag_enabled=rag_enabled,
+            confidence=result.confidence if rag_enabled else 0.0,
             citations=citations,
             retrieved_chunks=retrieved_chunks,
             rejected_chunks=rejected_chunks,
+            open_questions=self._extract_open_questions(answer),
+            retrieval_debug=self._debug_payload(result) if rag_enabled else None,
             fallback_reason=result.fallback_reason,
-            retrieval_debug=self._debug_payload(result),
-        )
-
-    def _fallback_response(self, result: RetrievalResult) -> ChatResponse:
-        rejected_chunks = [
-            RetrievedChunk(
-                chunk_id=item.chunk_id,
-                document_id=item.document_id,
-                filename=item.filename,
-                page_no=item.page_no,
-                section_title=item.section_title,
-                content=item.content,
-                score=item.score,
-                block_types=item.block_types,
-                image_url=self._image_url(item),
-            )
-            for item in result.rejected_contexts
-        ]
-        return ChatResponse(
-            answer=FALLBACK_ANSWER,
-            confidence=result.confidence,
-            citations=[],
-            retrieved_chunks=[],
-            rejected_chunks=rejected_chunks,
-            fallback_reason=result.fallback_reason or FALLBACK_ANSWER,
-            retrieval_debug=self._debug_payload(result),
         )
 
     def _debug_payload(self, result: RetrievalResult) -> dict | None:
@@ -168,26 +195,14 @@ class ChatService:
             "rerank_strategy": result.debug.rerank_strategy,
         }
 
-    def _log_chat(self, question: str, response: ChatResponse) -> None:
-        with SessionLocal() as session:
-            log = ChatLog(
-                question=question,
-                answer=response.answer,
-                confidence=response.confidence,
-                fallback_reason=response.fallback_reason,
-                retrieved_chunk_ids=json.dumps([item.chunk_id for item in response.citations], ensure_ascii=False),
-            )
-            session.add(log)
-            session.commit()
-
     @staticmethod
     def _to_prompt_context(index: int, item) -> dict:
         content = item.content
         if item.image_path:
             content = (
                 f"{content}\n"
-                f"说明：本条证据包含图片，图片会随本次请求一并提供。"
-                f"请读取该图片中的流程、节点、箭头、判断条件和文字内容。"
+                "说明：本条证据包含图片，图片会随本次请求一起提供。"
+                "请读取图片中的流程、节点、箭头、判断条件和文字内容。"
             )
         return {
             "citation_id": index,
@@ -217,6 +232,18 @@ class ChatService:
         return f"/storage/images/{item.document_id}/{Path(item.image_path).name}"
 
     @staticmethod
+    def _extract_open_questions(answer: str) -> list[str]:
+        match = re.search(r"##\s*12[.、]?\s*风险与待确认项(?P<body>.*?)(?:\n##\s*13[.、]?|\Z)", answer, re.S)
+        if not match:
+            return []
+        questions: list[str] = []
+        for raw_line in match.group("body").splitlines():
+            line = raw_line.strip().lstrip("-*0123456789.、) ").strip()
+            if line and ("确认" in line or "待定" in line or "需" in line):
+                questions.append(line)
+        return questions[:10]
+
+    @staticmethod
     def _sse_event(event: str, payload: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -231,11 +258,11 @@ class ChatService:
         return text
 
 
-_chat_service: ChatService | None = None
+_prd_service: PrdService | None = None
 
 
-def get_chat_service() -> ChatService:
-    global _chat_service
-    if _chat_service is None:
-        _chat_service = ChatService()
-    return _chat_service
+def get_prd_service() -> PrdService:
+    global _prd_service
+    if _prd_service is None:
+        _prd_service = PrdService()
+    return _prd_service

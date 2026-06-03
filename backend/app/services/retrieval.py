@@ -7,6 +7,14 @@ from app.services.keyword_store import get_keyword_store
 from app.services.vector_store import get_vector_store
 
 
+VECTOR_CANDIDATE_TOP_K = 8
+KEYWORD_CANDIDATE_TOP_K = 8
+IMAGE_CANDIDATE_TOP_K = 4
+VECTOR_KEEP_THRESHOLD = 0.85
+IMAGE_KEEP_THRESHOLD = 0.82
+FINAL_SCORE_KEEP_THRESHOLD = 0.6
+
+
 @dataclass(slots=True)
 class RetrievedContext:
     chunk_id: str
@@ -23,6 +31,8 @@ class RetrievedContext:
     keyword_score: float | None = None
     image_score: float | None = None
     rerank_score: float | None = None
+    lexical_score: float | None = None
+    title_score: float | None = None
     block_types: list[str] = field(default_factory=list)
     image_path: str | None = None
 
@@ -41,6 +51,7 @@ class RetrievalResult:
     confidence: float
     fallback_reason: str | None
     debug: RetrievalDebug = field(default_factory=RetrievalDebug)
+    rejected_contexts: list[RetrievedContext] = field(default_factory=list)
 
 
 class RetrievalService:
@@ -73,24 +84,22 @@ class RetrievalService:
             return RetrievalResult([], 0.0, FALLBACK_ANSWER, debug)
 
         reranked = self._rerank(question, candidates)
-        filtered = [
-            item
-            for item in reranked
-            if (item.rerank_score or 0.0) >= self.settings.rerank_score_threshold
-        ]
+        filtered = [item for item in reranked if self._should_keep(item)]
+        rejected = [item for item in reranked if not self._should_keep(item)][:5]
         if not filtered:
-            return RetrievalResult([], 0.0, FALLBACK_ANSWER, debug)
+            return RetrievalResult([], 0.0, FALLBACK_ANSWER, debug, rejected)
 
         deduped = self._dedupe_neighbors(filtered)
         trimmed = self._trim_contexts(deduped[:final_top_k])
         if not trimmed:
-            return RetrievalResult([], 0.0, FALLBACK_ANSWER, debug)
+            return RetrievalResult([], 0.0, FALLBACK_ANSWER, debug, rejected)
 
         return RetrievalResult(
             contexts=trimmed,
             confidence=self._calculate_confidence(trimmed),
             fallback_reason=None,
             debug=debug,
+            rejected_contexts=rejected,
         )
 
     def _merge_candidates(
@@ -104,15 +113,28 @@ class RetrievalService:
         query_embedding = self.provider.embed_query(question)
         vector_points = self.vector_store.query(
             query_embedding=query_embedding,
-            top_k=self.settings.vector_top_k,
+            top_k=VECTOR_CANDIDATE_TOP_K,
+            excluded_vector_variants=["image_visual"],
         ).get("points", [])
         debug.vector_hits = len(vector_points)
         for point in vector_points:
             metadata = point.payload or {}
+            if metadata.get("vector_variant") == "image_visual":
+                continue
             score = round(float(point.score), 4)
             if score < similarity_threshold:
                 continue
             chunk_id = str(metadata["chunk_id"])
+            if chunk_id in merged:
+                candidate = merged[chunk_id]
+                if score > (candidate.vector_score or 0.0):
+                    candidate.vector_score = score
+                    candidate.score = max(candidate.score, score)
+                candidate.retrieval_note = self._append_note(
+                    candidate.retrieval_note,
+                    f"vector retrieval hit variant={metadata.get('vector_variant', 'unknown')} score={score:.4f}",
+                )
+                continue
             merged[chunk_id] = RetrievedContext(
                 chunk_id=chunk_id,
                 document_id=metadata["document_id"],
@@ -123,7 +145,7 @@ class RetrievalService:
                 score=score,
                 start_offset=int(metadata.get("start_offset", 0)),
                 end_offset=int(metadata.get("end_offset", 0)),
-                retrieval_note="vector retrieval hit",
+                retrieval_note=f"vector retrieval hit variant={metadata.get('vector_variant', 'unknown')}",
                 vector_score=score,
                 block_types=list(metadata.get("block_types") or []),
                 image_path=metadata.get("image_path") or None,
@@ -131,21 +153,26 @@ class RetrievalService:
 
         image_points = self.vector_store.query_by_block_type(
             query_embedding=query_embedding,
-            top_k=self.settings.image_top_k,
+            top_k=IMAGE_CANDIDATE_TOP_K,
             block_type="image",
+            vector_variant="image_visual",
         ).get("points", [])
         debug.image_hits = len(image_points)
-        image_max = max((float(point.score) for point in image_points), default=0.0)
         for point in image_points:
             metadata = point.payload or {}
+            if metadata.get("vector_variant") != "image_visual":
+                continue
             chunk_id = str(metadata["chunk_id"])
             raw_score = round(float(point.score), 4)
-            normalized_score = round(raw_score / image_max, 4) if image_max else 0.0
+            if raw_score < similarity_threshold:
+                continue
             if chunk_id in merged:
                 candidate = merged[chunk_id]
-                candidate.image_score = normalized_score
-                candidate.retrieval_note = (
-                    f"{candidate.retrieval_note}; image vector hit raw={raw_score:.4f}"
+                candidate.image_score = max(candidate.image_score or 0.0, raw_score)
+                candidate.score = max(candidate.score, raw_score)
+                candidate.retrieval_note = self._append_note(
+                    candidate.retrieval_note,
+                    f"image visual hit score={raw_score:.4f}",
                 )
                 continue
             merged[chunk_id] = RetrievedContext(
@@ -155,16 +182,16 @@ class RetrievalService:
                 page_no=metadata.get("page_no") or None,
                 section_title=metadata.get("section_title") or None,
                 content=metadata.get("content", ""),
-                score=normalized_score,
+                score=raw_score,
                 start_offset=int(metadata.get("start_offset", 0)),
                 end_offset=int(metadata.get("end_offset", 0)),
-                retrieval_note=f"image vector hit raw={raw_score:.4f}, normalized={normalized_score:.4f}",
-                image_score=normalized_score,
+                retrieval_note=f"image visual hit score={raw_score:.4f}",
+                image_score=raw_score,
                 block_types=list(metadata.get("block_types") or []),
                 image_path=metadata.get("image_path") or None,
             )
 
-        keyword_hits = self.keyword_store.search(question, self.settings.keyword_top_k)
+        keyword_hits = self.keyword_store.search(question, KEYWORD_CANDIDATE_TOP_K)
         debug.keyword_hits = len(keyword_hits)
         keyword_max = max((item.score for item in keyword_hits), default=0.0)
         missing_chunk_ids = [item.chunk_id for item in keyword_hits if item.chunk_id not in merged]
@@ -173,9 +200,10 @@ class RetrievalService:
             normalized_score = round(hit.score / keyword_max, 4) if keyword_max else 0.0
             if hit.chunk_id in merged:
                 candidate = merged[hit.chunk_id]
-                candidate.keyword_score = normalized_score
-                candidate.retrieval_note = (
-                    f"{candidate.retrieval_note}; keyword hits: {', '.join(hit.matched_terms[:4])}"
+                candidate.keyword_score = max(candidate.keyword_score or 0.0, normalized_score)
+                candidate.retrieval_note = self._append_note(
+                    candidate.retrieval_note,
+                    f"keyword hits: {', '.join(hit.matched_terms[:4])}",
                 )
                 continue
             metadata = chunk_lookup.get(hit.chunk_id)
@@ -197,23 +225,14 @@ class RetrievalService:
                 image_path=metadata.get("image_path") or None,
             )
 
-        candidates = list(merged.values())
-        candidates.sort(
-            key=lambda item: (
-                (item.vector_score or 0.0)
-                + (item.keyword_score or 0.0)
-                + (item.image_score or 0.0)
-            ),
-            reverse=True,
-        )
-        return candidates[: max(self.settings.rerank_top_n, self.settings.top_k, self.settings.image_top_k)]
+        return list(merged.values())
 
     def _rerank(
         self,
         question: str,
         candidates: list[RetrievedContext],
     ) -> list[RetrievedContext]:
-        results = self._rule_rerank(question, candidates[: self.settings.rerank_top_n])
+        results = self._rule_rerank(question, candidates)
         results.sort(key=lambda item: item.rerank_score or 0.0, reverse=True)
         return results
 
@@ -223,24 +242,62 @@ class RetrievalService:
             content_terms = set(self.keyword_store._tokenize(candidate.content))
             overlap = len(question_terms & content_terms)
             lexical = overlap / max(len(question_terms), 1)
+            title_score = self._title_score(question_terms, candidate)
             vector_score = candidate.vector_score or 0.0
             keyword_score = candidate.keyword_score or 0.0
             image_score = candidate.image_score or 0.0
-            if "image" in candidate.block_types:
-                score = 0.80 * image_score + 0.20 * lexical
-            else:
-                score = (
-                    0.65 * vector_score
-                    + 0.25 * keyword_score
-                    + 0.10 * lexical
-                )
+            title_weight = 0.30 if self._is_visual_or_table_block(candidate) else 0.10
+            score = min(
+                1.0,
+                0.50 * max(vector_score, image_score)
+                + 0.25 * keyword_score
+                + 0.15 * lexical
+                + title_weight * title_score
+            )
+            candidate.lexical_score = round(lexical, 4)
+            candidate.title_score = round(title_score, 4)
             candidate.rerank_score = round(score, 4)
             candidate.score = candidate.rerank_score
             candidate.retrieval_note = (
                 f"rule rerank: vector={vector_score:.4f}, "
-                f"keyword={keyword_score:.4f}, image={image_score:.4f}, lexical={lexical:.4f}"
+                f"keyword={keyword_score:.4f}, image={image_score:.4f}, "
+                f"lexical={lexical:.4f}, title={title_score:.4f}, "
+                f"title_weight={title_weight:.2f}"
             )
         return candidates
+
+    def _should_keep(self, candidate: RetrievedContext) -> bool:
+        return (
+            (candidate.vector_score or 0.0) >= VECTOR_KEEP_THRESHOLD
+            or (candidate.image_score or 0.0) >= IMAGE_KEEP_THRESHOLD
+            or (candidate.rerank_score or 0.0) >= FINAL_SCORE_KEEP_THRESHOLD
+        )
+
+    def _title_score(self, question_terms: set[str], candidate: RetrievedContext) -> float:
+        if not question_terms:
+            return 0.0
+        title_text = " ".join(
+            item
+            for item in (
+                candidate.filename,
+                candidate.section_title or "",
+            )
+            if item
+        )
+        title_terms = set(self.keyword_store._tokenize(title_text))
+        if not title_terms:
+            return 0.0
+        return min(1.0, len(question_terms & title_terms) / max(len(question_terms), 1))
+
+    @staticmethod
+    def _is_visual_or_table_block(candidate: RetrievedContext) -> bool:
+        return bool({"image", "table"} & set(candidate.block_types))
+
+    @staticmethod
+    def _append_note(existing: str | None, note: str) -> str:
+        if not existing:
+            return note
+        return f"{existing}; {note}"
 
     def _dedupe_neighbors(self, contexts: list[RetrievedContext]) -> list[RetrievedContext]:
         deduped: list[RetrievedContext] = []

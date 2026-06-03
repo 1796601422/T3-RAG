@@ -44,27 +44,50 @@ class VectorStore:
         ]
         self._client.upsert(collection_name=self._collection_name, wait=True, points=points)
 
-    def query(self, *, query_embedding: list[float], top_k: int) -> dict:
+    def query(
+        self,
+        *,
+        query_embedding: list[float],
+        top_k: int,
+        excluded_vector_variants: list[str] | None = None,
+    ) -> dict:
         if not self._collection_exists():
             return {"points": []}
+        query_filter = self._vector_variant_exclusion_filter(excluded_vector_variants)
         response = self._client.query_points(
             collection_name=self._collection_name,
             query=query_embedding,
+            query_filter=query_filter,
             limit=top_k,
             with_payload=True,
         )
         return {"points": response.points}
 
-    def query_by_block_type(self, *, query_embedding: list[float], top_k: int, block_type: str) -> dict:
+    def query_by_block_type(
+        self,
+        *,
+        query_embedding: list[float],
+        top_k: int,
+        block_type: str,
+        vector_variant: str | None = None,
+    ) -> dict:
         if not self._collection_exists():
             return {"points": []}
-        query_filter = models.Filter(
-            must=[
+        must = [
+            models.FieldCondition(
+                key="block_types",
+                match=models.MatchAny(any=[block_type]),
+            )
+        ]
+        if vector_variant:
+            must.append(
                 models.FieldCondition(
-                    key="block_types",
-                    match=models.MatchAny(any=[block_type]),
+                    key="vector_variant",
+                    match=models.MatchValue(value=vector_variant),
                 )
-            ]
+            )
+        query_filter = models.Filter(
+            must=must
         )
         response = self._client.query_points(
             collection_name=self._collection_name,
@@ -74,6 +97,19 @@ class VectorStore:
             with_payload=True,
         )
         return {"points": response.points}
+
+    @staticmethod
+    def _vector_variant_exclusion_filter(excluded_vector_variants: list[str] | None):
+        if not excluded_vector_variants:
+            return None
+        return models.Filter(
+            must_not=[
+                models.FieldCondition(
+                    key="vector_variant",
+                    match=models.MatchAny(any=excluded_vector_variants),
+                )
+            ]
+        )
 
     def get_by_chunk_ids(self, chunk_ids: list[str]) -> dict[str, dict]:
         if not chunk_ids or not self._collection_exists():

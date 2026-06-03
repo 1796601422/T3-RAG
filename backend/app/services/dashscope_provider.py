@@ -175,13 +175,14 @@ class DashScopeProvider:
         self,
         messages: list[dict],
         temperature: float = 0.1,
+        enable_thinking: bool | None = None,
     ) -> Generator[str, None, None]:
         payload = {
             "model": self.settings.chat_model,
             "messages": messages,
             "temperature": temperature,
             "stream": True,
-            "enable_thinking": self.settings.enable_thinking,
+            "enable_thinking": self.settings.enable_thinking if enable_thinking is None else enable_thinking,
         }
         yield from self._stream_completion(payload)
 
@@ -190,13 +191,14 @@ class DashScopeProvider:
         messages: list[dict],
         image_items: list[tuple[str, str]],
         temperature: float = 0.1,
+        enable_thinking: bool | None = None,
     ) -> Generator[str, None, None]:
         payload = {
             "model": self.settings.vision_chat_model,
             "messages": self._with_image_content(messages, image_items),
             "temperature": temperature,
             "stream": True,
-            "enable_thinking": self.settings.enable_thinking,
+            "enable_thinking": self.settings.enable_thinking if enable_thinking is None else enable_thinking,
         }
         yield from self._stream_completion(payload)
 
