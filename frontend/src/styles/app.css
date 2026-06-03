@@ -45,6 +45,9 @@ button:disabled {
 
 .app-shell.prd-focus {
   grid-template-columns: minmax(0, 1fr);
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
   background: #eef1f4;
 }
 
@@ -229,7 +232,9 @@ button:disabled {
 }
 
 .prd-focus .content {
+  height: 100vh;
   min-height: 100vh;
+  overflow: hidden;
   padding: 18px;
 }
 
@@ -237,13 +242,16 @@ button:disabled {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 360px;
   gap: 20px;
+  height: calc(100vh - 56px);
   max-width: 1480px;
   margin: 0 auto;
+  overflow: hidden;
 }
 
 .prd-workbench {
   grid-template-columns: minmax(0, 1fr) 340px;
   gap: 16px;
+  height: calc(100vh - 36px);
   max-width: none;
   min-height: calc(100vh - 36px);
 }
@@ -252,6 +260,7 @@ button:disabled {
 .panel {
   display: flex;
   min-width: 0;
+  min-height: 0;
   flex-direction: column;
   gap: 18px;
 }
@@ -355,6 +364,18 @@ button:disabled {
   padding: 18px;
 }
 
+.query-box {
+  flex: 0 0 auto;
+}
+
+.answer-card {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 .mode-switch {
   display: inline-flex;
   gap: 4px;
@@ -394,6 +415,7 @@ button:disabled {
 
 .prd-workbench .workbench-main {
   min-height: calc(100vh - 36px);
+  overflow: hidden;
 }
 
 .prd-workbench .prd-chat-box {
@@ -428,6 +450,7 @@ button:disabled {
 .prd-workbench .prd-chat-panel {
   min-height: 0;
   margin: 14px 14px 0;
+  overflow: auto;
   border-color: #e7ebef;
   background: #f8fafb;
 }
@@ -689,6 +712,12 @@ button:disabled {
   line-height: 1.75;
 }
 
+.answer-card > .markdown-text {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
 .markdown-text strong {
   color: #20242a;
   font-weight: 700;
@@ -803,10 +832,13 @@ button:disabled {
 .evidence-panel {
   position: sticky;
   top: 28px;
-  max-height: calc(100vh - 56px);
   display: flex;
+  height: 100%;
+  max-height: calc(100vh - 56px);
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   padding: 16px;
 }
 
@@ -1125,11 +1157,18 @@ th {
 @media (max-width: 1180px) {
   .workbench {
     grid-template-columns: 1fr;
+    height: auto;
+    overflow: visible;
   }
 
   .evidence-panel {
     position: static;
+    height: auto;
     max-height: none;
+  }
+
+  .answer-card {
+    min-height: 360px;
   }
 }
 
